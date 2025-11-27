@@ -216,9 +216,646 @@
           <svg id="trendChart" viewBox="0 0 300 120" style="width:100%;height:120px;background:#fff5f5;border-radius:6px;padding:6px"></svg>
         </div>
       </div>
-    </div>
-    </div>
-  </div>
+    function saveCurrentNote(){
+      const notes = loadNotesFromStorage();
+      const payload = {
+        id: selectedId || ('n_' + Date.now()),
+        title: document.getElementById('title').value.trim() || 'Untitled',
+        participants: document.getElementById('participants').value.trim() || '',
+        importance: document.getElementById('importance') ? document.getElementById('importance').value : 'medium',
+        notes: notesEl.value,
+        created: Date.now()
+      };
+      const existingIndex = notes.findIndex(n=>n.id === payload.id);
+      if(existingIndex >= 0) notes[existingIndex] = payload; else notes.push(payload);
+      saveNotesToStorage(notes);
+      selectedId = payload.id;
+      renderNotesList();
+      alert('Note saved.');
+    }
+
+    function newNote(){
+      selectedId = null;
+      document.getElementById('title').value = '';
+      document.getElementById('participants').value = '';
+      notesEl.value = '';
+      renderNotesList();
+    }
+
+    function deleteSelectedNote(){
+      if(!selectedId){ alert('No saved note selected.'); return; }
+      if(!confirm('Delete selected note?')) return;
+      let notes = loadNotesFromStorage();
+      notes = notes.filter(n=>n.id !== selectedId);
+      saveNotesToStorage(notes);
+      selectedId = null;
+      newNote();
+      renderNotesList();
+    }
+
+    // wire buttons
+    saveNoteBtn.addEventListener('click', saveCurrentNote);
+    newNoteBtn.addEventListener('click', newNote);
+    deleteNoteBtn.addEventListener('click', deleteSelectedNote);
+    // rewrite button: regenerate summary with different mode (async)
+    rewriteBtn.addEventListener('click', async ()=>{
+      const mode = rewriteMode.value || 'concise';
+      const text = notesEl.value.trim();
+      if(!text){ alert('No notes to summarize.'); return; }
+      let n = parseInt(sentencesSel.value,10) || 3;
+      let tone = toneSel.value || 'Neutral';
+      if(mode === 'concise'){ n = Math.max(1, n-1); }
+      else if(mode === 'detailed'){ n = Math.min(8, n+2); }
+      else if(mode === 'action'){ tone = 'Action-focused'; }
+      const summary = await asyncSummarize(text,n,tone);
+      renderSummary(summary);
+    });
+
+    // --- Live meeting (speech-to-text) ---
+    let recognition = null;
+    let listening = false;
+    let transcriptBuffer = '';
+    let lastSummarizeAt = 0;
+    let autoSummarizeTimer = null;
+
+    function supportsSpeech(){
+      return !!(window.SpeechRecognition || window.webkitSpeechRecognition);
+    }
+
+    function scheduleAutoSummarize(delay=5000){
+      if(autoSummarizeTimer) clearTimeout(autoSummarizeTimer);
+      autoSummarizeTimer = setTimeout(async ()=>{
+        const text = notesEl.value.trim();
+        if(!text) return;
+        try{ await asyncSummarize(text, parseInt(sentencesSel.value,10)||3, toneSel.value); renderSummary(await asyncSummarize(text, parseInt(sentencesSel.value,10)||3, toneSel.value)); }
+        catch(e){ console.error('Auto summarize failed', e); }
+      }, delay);
+    }
+
+    async function startListening(){
+      if(!supportsSpeech()){ alert('Speech Recognition not supported in this browser. Chrome is recommended.'); return; }
+      const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+      recognition = new SpeechRecognition();
+      recognition.continuous = true;
+      recognition.interimResults = true;
+      recognition.lang = 'en-US';
+      recognition.onstart = () => { listening = true; liveBtn.textContent = 'Stop Live'; progStatus.textContent = 'Listening...'; };
+      recognition.onerror = (e) => { console.error('Speech error', e); progStatus.textContent = 'Speech error'; };
+      recognition.onend = () => { listening = false; liveBtn.textContent = 'Start Live'; progStatus.textContent = 'Idle'; recognition = null; };
+      recognition.onresult = (ev) => {
+        let interim = '';
+        for(let i=ev.resultIndex;i<ev.results.length;i++){
+          const res = ev.results[i];
+          if(res.isFinal){
+            const t = res[0].transcript.trim();
+            transcriptBuffer += t + ' ';
+            notesEl.value = (notesEl.value + ' ' + t).trim();
+            // schedule auto summarize after some silence
+            scheduleAutoSummarize(4000);
+          } else {
+            interim += res[0].transcript;
+          }
+        }
+        if(interim) progStatus.textContent = 'Listening (interim)...';
+      };
+      try{ recognition.start(); }
+      catch(e){ console.error(e); }
+    }
+
+    function stopListening(){
+      if(recognition){ recognition.stop(); recognition = null; }
+      listening = false; liveBtn.textContent = 'Start Live'; progStatus.textContent = 'Idle';
+      if(autoSummarizeTimer) { clearTimeout(autoSummarizeTimer); autoSummarizeTimer = null; }
+    }
+
+    liveBtn.addEventListener('click', ()=>{
+      if(listening){ stopListening(); }
+      else{ startListening(); }
+    });
+
+    // Send to Teams: copy formatted summary and open Teams web (user pastes into chat)
+    teamsBtn.addEventListener('click', async ()=>{
+      // take coverSummary HTML if present, else fallback to summaryList text
+      const html = (coverSummary && coverSummary.innerHTML && coverSummary.style.display !== 'none') ? coverSummary.innerHTML : Array.from(summaryList.querySelectorAll('li')).map(li=>li.textContent).join('\n');
+      if(!html || !html.trim()){ alert('No summary to send. Generate a summary first.'); return; }
+      // copy text (strip tags)
+      const temp = document.createElement('div'); temp.innerHTML = html; const asText = temp.innerText || temp.textContent || html;
+      try{ await navigator.clipboard.writeText(asText); }
+      catch(e){ const ta = document.createElement('textarea'); ta.value = asText; document.body.appendChild(ta); ta.select(); document.execCommand('copy'); ta.remove(); }
+      // open Teams web
+      window.open('https://teams.microsoft.com/', '_blank');
+      alert('Summary copied to clipboard. Opened Microsoft Teams—paste into chat or meeting notes.');
+    });
+
+    // professional format generation
+    proFormatBtn.addEventListener('click', ()=>{
+      const title = (document.getElementById('title').value || 'Meeting').trim();
+      const participants = (document.getElementById('participants').value || '').trim();
+      const sentences = Array.from(summaryList.querySelectorAll('li')).map(li=>li.textContent);
+      if(!sentences.length){ alert('No summary available. Generate a summary first.'); return; }
+      // show professional formatted summary in coverSummary area
+      const html = generateProfessionalFormatHTML(title, participants, sentences);
+      showCoverSummaryHtml(html);
+    });
+
+    // AI Formalize: call external LLM (OpenAI) to produce formal meeting minutes
+    aiFormalizeBtn.addEventListener('click', async ()=>{
+      const text = notesEl.value.trim();
+      if(!text){ alert('No notes to formalize.'); return; }
+      // get API key from input or sessionStorage
+      let key = (apiKeyInput && apiKeyInput.value) || sessionStorage.getItem('openai_api_key');
+      if(!key){ key = prompt('Enter your OpenAI API key (it will be stored in this browser session only):'); if(!key) return; sessionStorage.setItem('openai_api_key', key); if(apiKeyInput) apiKeyInput.value = key; }
+
+      // construct instruction
+      const title = (document.getElementById('title').value || 'Meeting').trim();
+      const participants = (document.getElementById('participants').value || '').trim();
+      const importance = (document.getElementById('importance') && document.getElementById('importance').value) || 'medium';
+
+      showProgress(); setProgress(5, 'Calling AI...');
+      try{
+        const prompt = `You are a professional meeting assistant. Convert the following raw meeting notes into a formal meeting minutes document. Output only an HTML fragment (no <html> or <body> tags) that contains: header with Title, Date, Participants, Importance; an Introduction paragraph; a Details/Body section with clear paragraphs; a Conclusion paragraph; Action Items (bulleted) with owners and deadlines if detectable; Decisions (bulleted). If dates or owners aren't present, leave owners blank. Use clear headings and concise, professional language.\n\nTitle: ${title}\nParticipants: ${participants}\nImportance: ${importance}\n\nRaw notes:\n${text}\n\nRespond with a clean HTML snippet.`;
+
+        const resp = await fetch('https://api.openai.com/v1/chat/completions',{ 
+          method:'POST',
+          headers:{'Content-Type':'application/json','Authorization':'Bearer ' + key},
+          body: JSON.stringify({model: 'gpt-4', messages:[{role:'system',content:'You are a concise meeting minutes generator.'},{role:'user',content:prompt}],max_tokens:800,temperature:0.2})
+        });
+        if(!resp.ok){ const txt = await resp.text(); throw new Error('AI request failed: ' + resp.status + ' ' + txt); }
+        const data = await resp.json();
+        const aiText = (data.choices && data.choices[0] && (data.choices[0].message && data.choices[0].message.content)) || (data.choices && data.choices[0] && data.choices[0].text) || '';
+        if(!aiText.trim()) throw new Error('Empty response from AI');
+        // show AI HTML result
+        showCoverSummaryHtml(aiText);
+        setProgress(100, 'AI done');
+      }catch(err){
+        console.error(err);
+        setProgress(0, 'AI failed');
+        alert('AI formalize failed: ' + (err && err.message ? err.message : String(err)));
+      }
+    });
+
+    // initial render of notes list
+    renderNotesList();
+
+    // Navigation between overview and main app
+    const overviewEl = document.getElementById('overview');
+    const appMainEl = document.getElementById('appMain');
+    const backBtn = document.getElementById('backBtn');
+    const openSummarizerBtn = document.getElementById('openSummarizerBtn');
+    const openPreviousBtn = document.getElementById('openPreviousBtn');
+
+    function showOverview(){
+      overviewEl.style.display = 'flex';
+      appMainEl.style.display = 'none';
+      backBtn.style.display = 'none';
+    }
+
+    function showMain(area){
+      overviewEl.style.display = 'none';
+      appMainEl.style.display = '';
+      backBtn.style.display = '';
+      // hide all main sub-views first
+      mainGridEl.style.display = 'none';
+      previousOnlyEl.style.display = 'none';
+      dashboardViewEl.style.display = 'none';
+      // reset left panel visibility and grid layout
+      if(leftPanelEl) leftPanelEl.style.display = '';
+      mainGridEl.style.gridTemplateColumns = '240px 1fr 320px';
+
+      if(area === 'summarizer'){
+        // In the Summarizer view we hide the previous-notes left panel
+        if(leftPanelEl) leftPanelEl.style.display = 'none';
+        // adjust grid to two columns: main + cover
+        mainGridEl.style.display = '';
+        mainGridEl.style.gridTemplateColumns = '1fr 320px';
+        notesEl.focus();
+      } else if(area === 'previous'){
+        // show full previous-notes page
+        previousOnlyEl.style.display = '';
+        renderPreviousOnly();
+      } else if(area === 'dashboard'){
+        dashboardViewEl.style.display = '';
+        renderDashboard();
+      }
+    }
+
+    openSummarizerBtn.addEventListener('click', ()=> showMain('summarizer'));
+    openPreviousBtn.addEventListener('click', ()=> showMain('previous'));
+    openDashboardBtn.addEventListener('click', ()=> showMain('dashboard'));
+    openPreviousOnlyBtn.addEventListener('click', ()=> showMain('previous'));
+    toggleLeftBtn.addEventListener('click', ()=>{
+      if(!leftPanelEl) return;
+      const isHidden = leftPanelEl.style.display === 'none';
+      if(isHidden){
+        leftPanelEl.style.display = '';
+        mainGridEl.style.gridTemplateColumns = '240px 1fr 320px';
+      } else {
+        leftPanelEl.style.display = 'none';
+        mainGridEl.style.gridTemplateColumns = '1fr 320px';
+      }
+    });
+    openSummarizerBtn.addEventListener('keydown', (e)=>{ if(e.key === 'Enter') showMain('summarizer'); });
+    openPreviousBtn.addEventListener('keydown', (e)=>{ if(e.key === 'Enter') showMain('previous'); });
+    backBtn.addEventListener('click', showOverview);
+
+    // Start on the overview landing page
+    showOverview();
+
+    // --- Dashboard rendering ---
+    function renderDashboard(){
+      const notes = loadNotesFromStorage();
+      // Table: date, title, importance
+      const table = document.getElementById('dashboardTable');
+      table.innerHTML = '';
+      if(!notes.length){ table.innerHTML = '<div class="muted">No saved notes to show.</div>'; return; }
+      const rows = notes.slice().reverse().map(n=>{
+        return `<div style="padding:8px;border-bottom:1px solid rgba(0,0,0,0.03)"><div style="font-weight:700">${escapeHtml(n.title||'Untitled')}</div><div class="muted" style="font-size:12px">${new Date(n.created).toLocaleString()} • Importance: ${n.importance||'medium'}</div></div>`;
+      }).join('');
+      table.innerHTML = rows;
+
+      // Trend: count per month (last 6 months)
+      const now = new Date();
+      const months = [];
+      for(let i=5;i>=0;i--){ const d = new Date(now.getFullYear(), now.getMonth()-i, 1); months.push(d); }
+      const counts = months.map(m => {
+        const start = +new Date(m.getFullYear(), m.getMonth(), 1);
+        const end = +new Date(m.getFullYear(), m.getMonth()+1, 1);
+        return notes.filter(n => n.created >= start && n.created < end).length;
+      });
+      // render simple SVG bars
+      const svg = document.getElementById('trendChart');
+      const w = 300, h = 120; svg.setAttribute('viewBox', `0 0 ${w} ${h}`);
+      svg.innerHTML = '';
+      const max = Math.max(1, ...counts);
+      const pad = 20; const bw = (w - pad*2) / counts.length; 
+      counts.forEach((c,i)=>{
+        const bwInner = Math.max(12, bw*0.6);
+        const x = pad + i*bw + (bw-bwInner)/2;
+        const barH = (h - pad*2) * (c / max);
+        const y = h - pad - barH;
+        const rect = `<rect x="${x.toFixed(1)}" y="${y.toFixed(1)}" width="${bwInner.toFixed(1)}" height="${barH.toFixed(1)}" rx="3" fill="#d62828" opacity="0.9"></rect>`;
+        const label = `<text x="${(x + bwInner/2).toFixed(1)}" y="${h - 6}" text-anchor="middle" font-size="10" fill="#7a1f1f">${months[i].toLocaleString(undefined,{month:'short'})}</text>`;
+        svg.innerHTML += rect + label;
+      });
+    }
+    // --- Progress helpers and async summarizer ---
+    function setProgress(p, status){
+      const pct = Math.max(0, Math.min(100, Math.round(p)));
+      if(progBar){
+        const circumference = 2 * Math.PI * 36; // r=36
+        const offset = circumference * (1 - pct/100);
+        progBar.style.strokeDashoffset = offset.toFixed(1);
+      }
+      if(progText) progText.textContent = pct + '%';
+      if(progStatus && status) progStatus.textContent = status;
+    }
+
+    function showProgress(){
+      if(progressWrapper) progressWrapper.style.display = '';
+      if(coverSummary) coverSummary.style.display = 'none';
+      setProgress(0, 'Starting...');
+    }
+
+    function hideProgress(){
+      if(progressWrapper) progressWrapper.style.display = '';
+    }
+
+    function showCoverSummaryHtml(html){
+      if(coverSummary){
+        coverSummary.innerHTML = html;
+        coverSummary.style.display = '';
+        if(progressWrapper) progressWrapper.style.display = 'none';
+      }
+    }
+
+    // process array items in small chunks to update progress
+    function processChunks(count, chunkSize, handler, onProgress){
+      return new Promise((resolve)=>{
+        let i = 0;
+        function step(){
+          const end = Math.min(count, i + chunkSize);
+          for(; i < end; i++) handler(i);
+          if(onProgress) onProgress(i);
+          if(i < count) setTimeout(step, 0); else resolve();
+        }
+        step();
+      });
+    }
+
+    async function asyncSummarize(text, n=3, tone='Neutral'){
+      showProgress();
+      setProgress(2, 'Preparing...');
+      await new Promise(r=>setTimeout(r,50));
+      const sentences = splitSentences(text);
+      if(!sentences.length){ setProgress(100, 'No content'); return []; }
+      const freq = Object.create(null);
+      // build frequency table in chunks
+      await processChunks(sentences.length, 6, (i)=>{
+        const s = sentences[i];
+        const words = getWords(s);
+        for(const w of words){ if(!stopwords.has(w)) freq[w] = (freq[w]||0) + 1; }
+      }, (done)=> setProgress(10 + (done/sentences.length)*30, 'Analyzing words...'));
+
+      const scores = new Array(sentences.length).fill(0);
+      await processChunks(sentences.length, 6, (i)=>{
+        const words = getWords(sentences[i]);
+        if(!words.length) { scores[i] = 0; return; }
+        let sum = 0;
+        for(const w of words) if(!stopwords.has(w)) sum += (freq[w]||0);
+        scores[i] = sum / Math.sqrt(words.length);
+      }, (done)=> setProgress(45 + (done/sentences.length)*45, 'Scoring sentences...'));
+
+      // select top n
+      setProgress(92, 'Selecting summary...');
+      await new Promise(r=>setTimeout(r,80));
+      const idx = scores.map((s,i)=> ({i,s})).sort((a,b)=> b.s - a.s).slice(0,n).sort((a,b)=> a.i - b.i).map(x=>x.i);
+      const result = idx.map(i=> sentences[i]);
+      setProgress(100, 'Done');
+      // show professional formatted summary in cover panel
+      const title = (document.getElementById('title').value || 'Meeting').trim();
+      const participants = (document.getElementById('participants').value || '').trim();
+      const importance = (document.getElementById('importance') && document.getElementById('importance').value) || 'medium';
+      const proHtml = generateProfessionalFormatHTML(title, participants, importance, result);
+      showCoverSummaryHtml(proHtml);
+      return result;
+    }
+    // Export / Import handlers
+    const exportBtn = document.getElementById('exportBtn');
+    const importBtn = document.getElementById('importBtn');
+    const fileInput = document.createElement('input'); fileInput.type='file'; fileInput.accept='application/json'; fileInput.style.display='none'; document.body.appendChild(fileInput);
+
+    exportBtn.addEventListener('click', ()=>{
+      const notes = loadNotesFromStorage();
+      const blob = new Blob([JSON.stringify(notes, null, 2)], {type:
+        'application/json'});
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a'); a.href = url; a.download = `meeting-notes-export-${Date.now()}.json`; document.body.appendChild(a); a.click(); a.remove(); URL.revokeObjectURL(url);
+    });
+
+    importBtn.addEventListener('click', ()=> fileInput.click());
+    fileInput.addEventListener('change', (e)=>{
+      const f = e.target.files && e.target.files[0];
+      if(!f) return;
+      const reader = new FileReader();
+      reader.onload = function(){
+        try{
+          const imported = JSON.parse(reader.result);
+          if(!Array.isArray(imported)) throw new Error('Invalid file format');
+          // merge: keep existing and add new items (avoid id collisions)
+          const existing = loadNotesFromStorage();
+          const existingIds = new Set(existing.map(x=>x.id));
+          const merged = existing.slice();
+          imported.forEach(item=>{
+            if(!item.id) item.id = 'n_' + Date.now() + '_' + Math.floor(Math.random()*1000);
+            if(existingIds.has(item.id)){
+              // create new id to avoid collision
+              item.id = item.id + '_' + Math.floor(Math.random()*1000);
+            }
+            merged.push(item);
+          });
+          saveNotesToStorage(merged);
+          alert('Imported '+ imported.length + ' notes.');
+          renderNotesList();
+        }catch(err){ alert('Import failed: ' + err.message); }
+      };
+      reader.readAsText(f);
+      // reset input
+      fileInput.value = '';
+    });
+
+    // --- File import for Summarizer (PDF, DOCX, XLSX, TXT) ---
+    const importFileBtn = document.getElementById('importFileBtn');
+    const fileInputMain = document.getElementById('fileInputMain');
+    const importStatus = document.getElementById('importStatus');
+
+    importFileBtn.addEventListener('click', ()=> fileInputMain.click());
+
+    fileInputMain.addEventListener('change', async (ev)=>{
+      const f = ev.target.files && ev.target.files[0];
+      if(!f) return;
+      importStatus.textContent = 'Importing: ' + f.name + ' — extracting text...';
+      try{
+        await ensureParsers();
+        const name = f.name || '';
+        const ext = name.split('.').pop().toLowerCase();
+        let text = '';
+        const arrayBuffer = await f.arrayBuffer();
+        if(ext === 'pdf'){
+          // use PDF.js
+          const pdfjsLib = window['pdfjsLib'] || window['pdfjs-dist/build/pdf'];
+          if(!pdfjsLib) throw new Error('PDF parser not available');
+          pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/2.16.105/pdf.worker.min.js';
+          const pdf = await pdfjsLib.getDocument({data:arrayBuffer}).promise;
+          for(let i=1;i<=pdf.numPages;i++){
+            const page = await pdf.getPage(i);
+            const content = await page.getTextContent();
+            const strs = content.items.map(it=>it.str).join(' ');
+            text += strs + '\n\n';
+          }
+        } else if(ext === 'docx' || ext === 'doc'){
+          // mammoth
+          if(!window.mammoth) throw new Error('DOCX parser not available');
+          const result = await window.mammoth.convertToHtml({arrayBuffer});
+          // strip tags
+          text = (result && result.value) ? result.value.replace(/<[^>]+>/g,' ').replace(/\s+/g,' ').trim() : '';
+        } else if(ext === 'xlsx' || ext === 'xls'){
+          if(!window.XLSX) throw new Error('XLSX parser not available');
+          const wb = window.XLSX.read(arrayBuffer, {type:'array'});
+          // concatenate sheets
+          wb.SheetNames.forEach(name => {
+            const sheet = wb.Sheets[name];
+            const csv = window.XLSX.utils.sheet_to_csv(sheet);
+            text += `Sheet: ${name}\n` + csv + '\n\n';
+          });
+        } else if(ext === 'txt' || ext === 'md'){
+          text = new TextDecoder().decode(arrayBuffer);
+        } else {
+          // fallback: try text
+          try{ text = new TextDecoder().decode(arrayBuffer); }catch(e){ text = ''; }
+        }
+
+        if(!text.trim()){
+          importStatus.textContent = 'Imported file, but no textual content detected. Please paste or type content manually.';
+        } else {
+          // prefill title from filename if title empty
+          const currentTitle = (document.getElementById('title').value || '').trim();
+          if(!currentTitle) document.getElementById('title').value = name.replace(/\.[^/.]+$/, '');
+          notesEl.value = text.trim();
+          importStatus.textContent = 'Imported: extracted text length ' + text.trim().length + ' characters.';
+          // run summarizer automatically (async)
+          try{ const n = parseInt(sentencesSel.value,10) || 3; const tone = toneSel.value || 'Neutral'; const summary = await asyncSummarize(notesEl.value, n, tone); renderSummary(summary); }
+          catch(e){ /* ignore */ }
+        }
+      }catch(err){
+        console.error(err);
+        importStatus.textContent = 'Import failed: ' + (err && err.message ? err.message : String(err));
+        alert('Import failed: ' + (err && err.message ? err.message : String(err)));
+      }
+      fileInputMain.value = '';
+    });
+
+    // --- Professional format generator ---
+    function extractActionsAndDecisions(sentences){
+      const actions = [];
+      const decisions = [];
+      sentences.forEach(s => {
+        const low = s.toLowerCase();
+        if(/action:|action\b|\bwill\b|assign(ed)?|action item|next steps|owner/i.test(s)) actions.push(s);
+        if(/decision:|decid(ed|es)?|agree(d|ment)?|approved?/i.test(s)) decisions.push(s);
+      });
+      return {actions, decisions};
+    }
+
+    function generateProfessionalFormatHTML(title, participants, importance, sentences){
+      const now = new Date();
+      const header = `
+        <div style="border-bottom:2px solid rgba(0,0,0,0.03);padding-bottom:8px;margin-bottom:10px">
+          <div style="font-size:20px;font-weight:800;color:${'#d62828'}">${escapeHtml(title)}</div>
+          <div style="color:#7a1f1f;font-size:13px;margin-top:6px">Date: ${now.toLocaleString()}${participants? ' • Participants: ' + escapeHtml(participants): ''} • Importance: ${escapeHtml(importance||'medium')}</div>
+        </div>`;
+
+      // Intro: first sentence if available
+      const intro = sentences.length ? escapeHtml(sentences[0]) : '';
+      // Body: middle sentences (excluding first and last when possible)
+      const bodySentences = sentences.length > 2 ? sentences.slice(1, sentences.length - 1) : sentences.slice(1);
+      const bodyHtml = bodySentences.length ? `<div style="margin-top:8px"><div style="font-weight:700">Details</div>${bodySentences.map(s=>`<p style="margin:6px 0">${escapeHtml(s)}</p>`).join('')}</div>` : '';
+      // Conclusion: last sentence
+      const conclusion = (sentences.length > 1) ? escapeHtml(sentences[sentences.length - 1]) : '';
+
+      const {actions, decisions} = extractActionsAndDecisions(sentences);
+      const actionsHtml = actions.length ? `<div style="margin-top:12px"><div style="font-weight:700">Action Items</div><ol>${actions.map(a=>`<li style="margin:6px 0">${escapeHtml(a)}</li>`).join('')}</ol></div>` : '';
+      const decisionsHtml = decisions.length ? `<div style="margin-top:12px"><div style="font-weight:700">Decisions</div><ol>${decisions.map(d=>`<li style="margin:6px 0">${escapeHtml(d)}</li>`).join('')}</ol></div>` : '';
+
+      const introHtml = intro ? `<div style="margin-top:8px"><div style="font-weight:700">Introduction</div><p style="margin:6px 0">${intro}</p></div>` : '';
+      const conclusionHtml = conclusion ? `<div style="margin-top:12px"><div style="font-weight:700">Conclusion</div><p style="margin:6px 0">${conclusion}</p></div>` : '';
+
+      const footer = `<div style="margin-top:14px;color:#7a1f1f;font-size:12px">Generated by Meeting Notes — Summarizer</div>`;
+      return `<div style="text-align:left;line-height:1.45">${header}${introHtml}${bodyHtml}${conclusionHtml}${actionsHtml}${decisionsHtml}${footer}</div>`;
+    }
+
+    function renderSummary(sentences){
+      summaryList.innerHTML = '';
+      if(!sentences || !sentences.length){
+        summaryArea.textContent = 'No summary yet. Click "Summarize" to generate a concise summary from your notes.';
+        return;
+      }
+      summaryArea.textContent = '';
+      sentences.forEach(s => {
+        const li = document.createElement('li');
+        li.textContent = s;
+        summaryList.appendChild(li);
+      });
+      metaOut.innerHTML = `<div class="muted">Generated ${sentences.length} ${sentences.length===1? 'sentence':'sentences'} • ${new Date().toLocaleString()}</div>`;
+    }
+
+    summarizeBtn.addEventListener('click', async ()=>{
+      const text = notesEl.value.trim();
+      if(!text){
+        alert('Please paste meeting notes before summarizing.');
+        return;
+      }
+      const n = parseInt(sentencesSel.value,10) || 3;
+      const tone = toneSel.value;
+      const summary = await asyncSummarize(text,n,tone);
+      renderSummary(summary);
+    });
+
+    clearBtn.addEventListener('click', ()=>{
+      notesEl.value = '';
+      summaryList.innerHTML = '';
+      summaryArea.textContent = 'No summary yet. Click "Summarize" to generate a concise summary from your notes.';
+      metaOut.innerHTML = '';
+    });
+
+    copyBtn.addEventListener('click', async ()=>{
+      const items = Array.from(summaryList.querySelectorAll('li')).map(li=>li.textContent).join('\n\n');
+      if(!items){ alert('No summary to copy.'); return; }
+      try{ await navigator.clipboard.writeText(items); alert('Summary copied to clipboard.'); }
+      catch(e){
+        // fallback
+        const ta = document.createElement('textarea'); ta.value = items; document.body.appendChild(ta); ta.select(); document.execCommand('copy'); ta.remove(); alert('Summary copied (fallback).');
+      }
+    });
+
+    downloadBtn.addEventListener('click', ()=>{
+      const title = (document.getElementById('title').value || 'meeting-summary').replace(/[^a-z0-9\-]+/gi,'-').toLowerCase();
+      const body = Array.from(summaryList.querySelectorAll('li')).map((li,i)=>`${i+1}. ${li.textContent}`).join('\n\n');
+      if(!body){ alert('No summary to download.'); return; }
+      const blob = new Blob([body],{type:'text/plain'});
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a'); a.href = url; a.download = `${title}.txt`; document.body.appendChild(a); a.click(); a.remove(); URL.revokeObjectURL(url);
+    });
+
+    emailBtn.addEventListener('click', ()=>{
+      const title = document.getElementById('title').value || 'Meeting Summary';
+      const participants = document.getElementById('participants').value || '';
+      const sentences = Array.from(summaryList.querySelectorAll('li')).map(li=>li.textContent);
+      if(!sentences.length){ alert('Please generate a summary first.'); return; }
+      const bodyHeader = `Title: ${title}\nParticipants: ${participants}\nDate: ${new Date().toLocaleString()}\n\n`;
+      const bodySummary = sentences.map((s,i)=>`${i+1}. ${s}`).join('\n\n');
+      const body = bodyHeader + bodySummary + '\n\n--\nGenerated with Meeting Notes — Summarizer';
+      const subject = `${title} — Summary`;
+      const mailto = `mailto:?subject=${encodeURIComponent(subject)}&body=${encodeURIComponent(body)}`;
+      // Open default mail client
+      window.location.href = mailto;
+    });
+
+    // keyboard shortcut: Ctrl+Enter to summarize
+    notesEl.addEventListener('keydown', (e)=>{ if(e.ctrlKey && e.key === 'Enter') summarizeBtn.click(); });
+
+    // initial state
+    renderSummary([]);
+  </script>
+</body>
+</html>
+    .overview-card{width:220px;padding:18px;border-radius:12px;background:#fff;border:1px solid rgba(214,40,40,0.08);cursor:pointer;display:flex;flex-direction:column;align-items:center;justify-content:center;box-shadow:0 6px 14px rgba(214,40,40,0.06);transition:transform .12s ease,box-shadow .12s ease}
+    .overview-card:hover{transform:translateY(-6px);box-shadow:0 12px 28px rgba(214,40,40,0.08)}
+    .overview-card .icon{width:36px;height:36px}
+    .overview-card h2{margin:10px 0 6px;color:var(--accent);font-size:16px}
+    .overview-card p{margin:0;color:var(--muted);font-size:13px}
+    header{display:flex;align-items:center;gap:16px;margin-bottom:18px}
+    .header-actions{margin-left:auto;display:flex;gap:8px;align-items:center}
+    .logo{width:56px;height:56px;background:linear-gradient(135deg,var(--accent),#ff6b6b);border-radius:12px;display:flex;align-items:center;justify-content:center;color:#fff;font-weight:700;box-shadow:var(--shadow)}
+    h1{font-size:20px;margin:0}
+    p.lead{margin:4px 0 0;color:var(--muted);font-size:13px}
+
+    .grid{display:grid;grid-template-columns:240px 1fr 320px;gap:18px}
+    .left-panel{display:flex;flex-direction:column;gap:12px}
+    .left-panel .panel-title{font-weight:700;padding:10px 12px;border-bottom:1px solid #fdecea;color:var(--muted)}
+    .note-item{padding:10px 12px;border-radius:8px;background:#fff;cursor:pointer;border:1px solid transparent}
+    .note-item:hover{background:#fff5f5;border-color:rgba(214,40,40,0.08)}
+    .note-item.active{background:linear-gradient(90deg,#ffecec,#fff5f5)}
+    .cover{display:flex;flex-direction:column;align-items:center;justify-content:center;height:100%;text-align:center;color:var(--muted)}
+    .cover .title{font-size:20px;font-weight:700;color:var(--accent);margin-bottom:12px}
+    .cover svg{width:160px;height:160px;opacity:0.95}
+    /* circular progress */
+    .progress-wrap{display:flex;flex-direction:column;align-items:center;gap:8px}
+    .progress-circle{width:120px;height:120px}
+    .progress-perc{font-size:18px;font-weight:700;color:var(--accent)}
+    .card{background:var(--card);padding:18px;border-radius:var(--radius);box-shadow:var(--shadow)}
+    label{display:block;font-weight:600;margin-bottom:6px}
+    input[type=text],textarea,select{width:100%;padding:10px 12px;border:1px solid #e6e9ef;border-radius:8px;font-size:14px;background:transparent}
+    textarea{min-height:220px;resize:vertical}
+    .meta{display:flex;gap:12px;margin-bottom:12px}
+    .meta>div{flex:1}
+
+    .controls{display:flex;gap:8px;flex-wrap:wrap;margin-top:12px}
+    button{background:var(--accent);color:#fff;border:0;padding:10px 14px;border-radius:8px;cursor:pointer;font-weight:600}
+    button.ghost{background:transparent;color:var(--accent);border:1px solid #e6e9ef}
+    .small{padding:8px 10px;font-size:13px}
+    .muted{color:var(--muted);font-size:13px}
+
+    .summary-list{list-style:none;padding-left:0;margin:0}
+    .summary-list li{padding:10px 12px;border-radius:8px;background:#fff5f5;margin-bottom:8px}
+
+    footer{margin-top:16px;color:var(--muted);font-size:13px}
+
+    @media (max-width:920px){.grid{grid-template-columns:1fr;}.logo{width:48px;height:48px}}
+  </style>
+</head>
+<body>
+  <div class="container">
+    
 
   <script>
     // Load helper libraries via CDN dynamically (only when import used)
